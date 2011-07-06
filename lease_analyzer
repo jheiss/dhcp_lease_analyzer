@@ -1,0 +1,273 @@
+#!/usr/bin/perl -w
+
+use Getopt::Long;
+use Data::Dumper;
+use Time::Local;
+
+sub usage
+{
+	my $msg = shift;
+
+	warn "$msg\n\n" if ($msg);
+	warn "Usage: lease_analyzer\n";
+	warn "     [--config /path/to/dhcpd.conf ]\n";
+	warn "     [--leases /path/to/dhcpd.leases]\n";
+	exit 1;
+}
+
+# Read the command line options
+my $config = '/etc/dhcpd.conf';
+my $leases = '/var/lib/dhcp/dhcpd.leases';
+my $help;
+my $r = GetOptions(
+	'config=s' => \$config,
+	'leases=s' => \$leases,
+	'help' => \$help);
+usage() unless ($r);
+usage() if ($help);
+usage("Config file $config doesn't exist") unless (-f $config);
+usage("Lease file $leases doesn't exist") unless (-f $leases);
+
+# Read dhcpd.conf
+my %subnets = read_config($config);
+
+# Read the leases file and insert stats into %subnets
+read_leases($leases, \%subnets);
+
+# Print a report
+print "Subnets:\n";
+foreach my $subnet (sort keys %subnets)
+{
+	my $inuse_percent = sprintf("%.1f%%",
+		$subnets{$subnet}->{valid} / $subnets{$subnet}->{total} * 100);
+
+	print "  $subnet:  $subnets{$subnet}->{total} total, " .
+		"$subnets{$subnet}->{valid} in use ($inuse_percent)\n";
+}
+print "\n";
+
+#
+# Subroutines
+#
+
+# Read the range declarations out of the given dhcpd.conf file
+sub read_config
+{
+	my $config = shift || die;
+
+	my %subnets;
+	my $current_subnet;
+	open(CONFIG, '<', $config) || die "Can't read $config: $!\n";
+	while(<CONFIG>)
+	{
+		next if (/^\s*#/);  # Skip comments;
+
+		if (/subnet ([\d\.]+) netmask ([\d\.]+)/)
+		{
+			my $subnet_number = $1;
+			my $subnet_netmask = $2;
+
+			$current_subnet = "$subnet_number/$subnet_netmask";
+		}
+		if (/range (?:dynamic-bootp )?([\d\.]+) ([\d\.]+)/)
+		{
+			my $range_start = $1;
+			my $range_end = $2;
+
+			# Range declarations must occur inside a subnet
+			# declaration
+			die if (! $current_subnet);
+
+			my $range = $range_start . '-' . $range_end;
+			my $range_size =
+				calculate_range_size($range_start, $range_end);
+
+			$subnets{$current_subnet}->{ranges}->{$range} = 1;
+			$subnets{$current_subnet}->{total} += $range_size;
+			$subnets{$current_subnet}->{valid} = 0;
+		}
+	}
+	close(CONFIG);
+
+	#print "Ranges:\n";
+	#print Dumper(\%subnets);
+
+	return %subnets;
+}
+
+# Read the given dhcpd.leases and insert statistics about usage into the
+# given %subnets hash.
+sub read_leases
+{
+	my $leases = shift || die;
+	my $subnet_ref = shift || die;
+	my %subnets = %$subnet_ref;
+
+	my %leases;
+	my $current_ip;
+	my $start;
+	my $end;
+	open(LEASES, '<', $leases) || die "Can't read $leases: $!\n";
+	while(<LEASES>)
+	{
+		if (/^lease ([\d\.]+)/)
+		{
+			my $new_ip = $1;
+
+			# Check to see if we've accumulated a set of info for a
+			# current lease
+			if ($current_ip && $start && $end &&
+				lease_time_in_range($start, $end))
+			{
+				# Check to see if the lease is in one of the ranges we
+				# found in the config file.  The lease could be for a
+				# fixed-address declaration and we don't want to count
+				# those.
+				foreach my $subnet (keys %subnets)
+				{
+					foreach my $range (keys %{$subnets{$subnet}->{ranges}})
+					{
+						if (address_in_range($range, $current_ip))
+						{
+							$subnets{$subnet}->{valid} += 1;
+						}
+					}
+				}
+			}
+
+			$current_ip = $new_ip;
+			$start = '';
+			$end = '';
+		}
+		elsif (/starts (.*)/)
+		{
+			$start = $1;
+		}
+		elsif (/ends (.*)/)
+		{
+			$end = $1;
+		}
+	}
+	close(LEASES);
+	# Process the last entry read from the file
+	if ($current_ip && $start && $end && lease_time_in_range($start, $end))
+	{
+		# Check to see if the lease is in one of the ranges we found in
+		# the config file.  The lease could be for a fixed-address
+		# declaration and we don't want to count those.
+		foreach my $subnet (keys %subnets)
+		{
+			foreach my $range (keys %{$subnets{$subnet}->{ranges}})
+			{
+				if (address_in_range($range, $current_ip))
+				{
+					$subnets{$subnet}->{valid} += 1;
+				}
+			}
+		}
+	}
+}
+
+# Given the start and end IPs for a range, calculate the number of IPs
+# in that range.
+sub calculate_range_size
+{
+	my $range_start = shift;
+	my $range_end = shift;
+
+	my $range_size = 0;
+
+	my (@start_octets) = split(/\./, $range_start);
+	my (@end_octets) = split(/\./, $range_end);
+
+	$range_size += ($end_octets[0] - $start_octets[0]) * 256 * 256 * 256;
+	$range_size += ($end_octets[1] - $start_octets[1]) * 256 * 256;
+	$range_size += ($end_octets[2] - $start_octets[2]) * 256;
+	$range_size += ($end_octets[3] - $start_octets[3]);
+
+	return $range_size;
+}
+
+# Given the start and end time for a lease, determine if we are
+# presently in that range of time.
+sub lease_time_in_range
+{
+	my $start = shift;
+	my $end = shift;
+
+	# Convert dates to Unix time
+	my $starttime = convert_leasetime_to_unixtime($start);
+	my $endtime = convert_leasetime_to_unixtime($end);
+
+	if (time >= $starttime && time <= $endtime)
+	{
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+# Convert dates in the format used in dhcpd.leases to Unix time
+sub convert_leasetime_to_unixtime
+{
+	my $leasetime = shift;
+
+	# From dhcpd.leases(5) the data format is:
+	# weekday year/month/day hour:minute:second
+	# or 'never'
+
+	my $unixtime;
+	if ($leasetime eq 'never')
+	{
+		die;
+	}
+	else
+	{
+		$leasetime =~ m,(\d) (\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+),;
+		my $wday = $1;
+		my $year = $2 - 1900;
+		my $mon = $3 - 1;
+		my $mday = $4;
+		my $hour = $5;
+		my $min = $6;
+		my $sec = $7;
+		$unixtime = timegm($sec, $min, $hour, $mday, $mon, $year);
+	}
+
+	return $unixtime;
+}
+
+# Given a range of IPs (like 192.168.1.0-192.168.5.255) and a IP,
+# determine if the IP falls into that range.
+sub address_in_range
+{
+	my $range = shift;
+	my $address = shift;
+
+	my ($range_start, $range_end) = split(/-/, $range);
+
+	my (@start_octets) = split(/\./, $range_start);
+	my (@end_octets) = split(/\./, $range_end);
+	my (@address_octets) = split(/\./, $address);
+
+	if ($start_octets[0] <= $address_octets[0] &&
+		$address_octets[0] <= $end_octets[0] &&
+		$start_octets[1] <= $address_octets[1] &&
+		$address_octets[1] <= $end_octets[1] &&
+		$start_octets[2] <= $address_octets[2] &&
+		$address_octets[2] <= $end_octets[2] &&
+		$start_octets[3] <= $address_octets[3] &&
+		$address_octets[3] <= $end_octets[3])
+	{
+		# Address is in range
+		return 1;
+	}
+	else
+	{
+		# Address is not in range
+		return 0;
+	}
+}
+

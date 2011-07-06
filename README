@@ -1,0 +1,3 @@
+A simple script to analyze your ISC DHCP server configuration and lease
+files and report how many leases are in use.
+
